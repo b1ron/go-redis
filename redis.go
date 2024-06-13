@@ -198,6 +198,7 @@ func (hs *hooksMixin) processTxPipelineHook(ctx context.Context, cmds []Cmder) e
 type baseClient struct {
 	opt      *Options
 	connPool pool.Pooler
+	connInfo map[string]interface{} // stores the HELLO command result upon initialization
 
 	onClose func() error // hook called when client is closed
 }
@@ -303,22 +304,23 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
 		protocol = 3
 	}
 
-	// for redis-server versions that do not support the HELLO command,
-	// RESP2 will continue to be used.
-	if err = conn.Hello(ctx, protocol, username, password, "").Err(); err == nil {
-		auth = true
-	} else if !isRedisError(err) {
-		// When the server responds with the RESP protocol and the result is not a normal
-		// execution result of the HELLO command, we consider it to be an indication that
-		// the server does not support the HELLO command.
-		// The server may be a redis-server that does not support the HELLO command,
-		// or it could be DragonflyDB or a third-party redis-proxy. They all respond
-		// with different error string results for unsupported commands, making it
-		// difficult to rely on error strings to determine all results.
-		return err
-	}
-
 	_, err = conn.Pipelined(ctx, func(pipe Pipeliner) error {
+		// for redis-server versions that do not support the HELLO command,
+		// RESP2 will continue to be used.
+		if res, err := pipe.Hello(ctx, protocol, username, password, "").Result(); err == nil {
+			auth = true
+			conn.connInfo = res
+		} else if !isRedisError(err) {
+			// When the server responds with the RESP protocol and the result is not a normal
+			// execution result of the HELLO command, we consider it to be an indication that
+			// the server does not support the HELLO command.
+			// The server may be a redis-server that does not support the HELLO command,
+			// or it could be DragonflyDB or a third-party redis-proxy. They all respond
+			// with different error string results for unsupported commands, making it
+			// difficult to rely on error strings to determine all results.
+			return err
+		}
+
 		if !auth && password != "" {
 			if username != "" {
 				pipe.AuthACL(ctx, username, password)
@@ -339,22 +341,20 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
 			pipe.ClientSetName(ctx, c.opt.ClientName)
 		}
 
+		if !c.opt.DisableIndentity {
+			libName := ""
+			libVer := Version()
+			if c.opt.IdentitySuffix != "" {
+				libName = c.opt.IdentitySuffix
+			}
+			pipe.ClientSetInfo(ctx, WithLibraryName(libName))
+			pipe.ClientSetInfo(ctx, WithLibraryVersion(libVer))
+		}
+
 		return nil
 	})
 	if err != nil {
 		return err
-	}
-
-	if !c.opt.DisableIndentity {
-		libName := ""
-		libVer := Version()
-		if c.opt.IdentitySuffix != "" {
-			libName = c.opt.IdentitySuffix
-		}
-		p := conn.Pipeline()
-		p.ClientSetInfo(ctx, WithLibraryName(libName))
-		p.ClientSetInfo(ctx, WithLibraryVersion(libVer))
-		_, _ = p.Exec(ctx)
 	}
 
 	if c.opt.OnConnect != nil {
